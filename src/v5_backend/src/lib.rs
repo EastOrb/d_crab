@@ -23,12 +23,22 @@ thread_local! {
 }
 
 fn generate_poll_id(poll_name: &str, author_id: &str) -> String {
-    
     let mut hasher = Sha256::new();
     hasher.update(poll_name);
     hasher.update(author_id);
     let result = hasher.finalize();
-    format!("{:x}", result)[..15].to_string()
+    // Use a longer portion of the hash to avoid collisions
+    format!("{:x}", result)[..32].to_string()
+}
+
+// Validate input string to avoid potential security issues
+fn validate_input(input: &str, max_length: usize, field_name: &str) {
+    if input.trim().is_empty() {
+        ic_cdk::trap(&format!("{} cannot be empty.", field_name));
+    }
+    if input.len() > max_length {
+        ic_cdk::trap(&format!("{} exceeds max length of {} characters.", field_name, max_length));
+    }
 }
 
 #[ic_cdk::update]
@@ -37,23 +47,29 @@ fn create_vote_poll(author_principal1: String, poll_name1: String, public1: bool
     if caller == Principal::anonymous() {
         ic_cdk::trap("Anonymous callers are not allowed to create vote poll.");
     }
+
+    validate_input(&author_principal1, 128, "Author principal");
+    validate_input(&poll_name1, 128, "Poll name");
+
     VOTE_POLLS.with(|polls| {
         let mut polls_map = polls.borrow_mut();
-        if !polls_map.contains_key(&poll_name1) {
-            let new_poll = VotePoll {
-                poll_id: generate_poll_id(&poll_name1, &author_principal1),
-                poll_name: poll_name1.clone(),
-                public: public1,
-                author_principal: author_principal1,
-                voters: Vec::new(),
-                votes: vec![vec![Vec::new(); 24]; 7], // Inicjalizacja tablicy 24x7
-            };
-            polls_map.insert(poll_name1, new_poll);
-        } else {
-            panic!("Poll with the same name already exists");
+        if polls_map.values().any(|poll| poll.poll_name == poll_name1) {
+            ic_cdk::trap("Poll with the same name already exists");
         }
+
+        let new_poll = VotePoll {
+            poll_id: generate_poll_id(&poll_name1, &author_principal1),
+            poll_name: poll_name1.clone(),
+            public: public1,
+            author_principal: author_principal1,
+            voters: HashSet::new(),
+            votes: vec![vec![Vec::new(); 24]; 7], // 24x7 table for votes
+        };
+
+        polls_map.insert(new_poll.poll_id.clone(), new_poll); // Use poll_id as the key
     });
 }
+
 
 #[ic_cdk::query]
 fn get_vote_polls_names_and_ids_by_author(author_principal1: String) -> Vec<Vec<String>> {
@@ -61,6 +77,9 @@ fn get_vote_polls_names_and_ids_by_author(author_principal1: String) -> Vec<Vec<
     if caller == Principal::anonymous() {
         ic_cdk::trap("Anonymous callers are not allowed.");
     }
+
+    validate_input(&author_principal1, 128, "Author principal");
+
     VOTE_POLLS.with(|polls| {
         let polls_map = polls.borrow();
         polls_map.values()
@@ -70,23 +89,25 @@ fn get_vote_polls_names_and_ids_by_author(author_principal1: String) -> Vec<Vec<
     })
 }
 
+
+
 #[ic_cdk::query]
 fn get_vote_poll_by_id(poll_id1: String) -> VotePoll {
     let caller = ic_cdk::caller();
     if caller == Principal::anonymous() {
         ic_cdk::trap("Anonymous callers are not allowed.");
     }
+
+    validate_input(&poll_id1, 64, "Poll ID");
+
     VOTE_POLLS.with(|polls| {
         let polls_map = polls.borrow();
-        let poll = polls_map.values()
-            .find(|poll| poll.poll_id.clone() == poll_id1.clone())
-            .unwrap_or_else(|| panic!("Poll not found for id: {}", poll_id1))
-            .clone(); 
-        poll
+        polls_map.values()
+            .find(|poll| poll.poll_id == poll_id1)
+            .cloned()
+            .unwrap_or_else(|| ic_cdk::trap(&format!("Poll not found for ID: {}", poll_id1)))
     })
 }
-
-
 
 #[ic_cdk::update]
 fn add_vote(voter_id1: String, poll_id1: String, selected_cells: Vec<Vec<usize>>) {
@@ -94,32 +115,41 @@ fn add_vote(voter_id1: String, poll_id1: String, selected_cells: Vec<Vec<usize>>
     if caller == Principal::anonymous() {
         ic_cdk::trap("Anonymous callers are not allowed.");
     }
-    let poll_name1: String = get_pollname_by_pollid(poll_id1);
+
+    validate_input(&voter_id1, 128, "Voter ID");
+    validate_input(&poll_id1, 64, "Poll ID");
+
     VOTE_POLLS.with(|polls| {
         let mut polls_map = polls.borrow_mut();
+        let poll_name1 = get_pollname_by_pollid(&poll_id1);
+
         if let Some(poll) = polls_map.get_mut(&poll_name1) {
-            if poll.voters.contains(&voter_id1) {
-                poll.votes.iter_mut().for_each(|day| {
-                    day.iter_mut().for_each(|hour| {
-                        hour.retain(|id| id != &voter_id1);
-                    });
+            // Remove any previous votes by this voter
+            poll.votes.iter_mut().for_each(|day| {
+                day.iter_mut().for_each(|hour| {
+                    hour.retain(|id| id != &voter_id1);
                 });
-            }
+            });
+
+            // Add new votes based on selected cells
             for cell in selected_cells {
-                if cell[0] < 24 && cell[1] < 7 {
-                    poll.votes[cell[1]][cell[0]].push(voter_id1.clone());
-                } else {
-                    panic!("Invalid day or hour");
+                if cell.len() != 2 || cell[0] >= 24 || cell[1] >= 7 {
+                    ic_cdk::trap("Invalid day or hour for voting.");
                 }
+                poll.votes[cell[1]][cell[0]].push(voter_id1.clone());
             }
-            if !poll.voters.contains(&voter_id1) {
-                poll.voters.push(voter_id1);
-            }
+
+            // Add voter to the set of voters, preventing duplicates
+            poll.voters.insert(voter_id1.clone());
         } else {
-            panic!("Poll not found");
+            ic_cdk::trap("Poll not found");
         }
     });
 }
+
+
+
+#[ic_cdk::update]
 
 fn get_pollname_by_pollid(poll_id1: String) -> String {
     let caller = ic_cdk::caller();
@@ -135,7 +165,6 @@ fn get_pollname_by_pollid(poll_id1: String) -> String {
             .unwrap_or_else(|| panic!("Poll with ID {} not found", poll_id1))
     })
 }
-
 
 
 #[ic_cdk::query]
@@ -161,6 +190,7 @@ fn get_all_vote_polls() -> Vec<VotePoll> {
     if caller == Principal::anonymous() {
         ic_cdk::trap("Anonymous callers are not allowed.");
     }
+
     VOTE_POLLS.with(|polls| {
         let polls_map = polls.borrow();
         polls_map.values().cloned().collect()
@@ -168,11 +198,16 @@ fn get_all_vote_polls() -> Vec<VotePoll> {
 }
 
 
-
-
 #[ic_cdk::query]
 fn greet(name: String, principal: String) -> String {
-    format!("Hello, {}! principal:{}", name,  principal)
+    validate_input(&name, 128, "Name");
+    validate_input(&principal, 128, "Principal");
+
+    format!("Hello, {}! principal:{}", name, principal)
 }
+
+
+
+
 
 ic_cdk::export_candid!();
